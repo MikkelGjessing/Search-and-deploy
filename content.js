@@ -29,6 +29,7 @@ const SOUND_THROTTLE_MS       = 1500;   // minimum ms between successive sound p
 const PARTICLE_COUNT          = 22;     // number of confetti particles per celebration
 
 // Bundled sound files in assets/sounds/
+// NOTE: Also listed in options.js — keep both in sync (no shared module possible without a bundler).
 const AVAILABLE_SOUNDS = ['pop.wav', 'chime.wav', 'success.wav'];
 
 // Confetti particle colours

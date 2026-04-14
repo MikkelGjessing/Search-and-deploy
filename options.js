@@ -6,8 +6,13 @@
  * alongside the rules managed by content.js.
  */
 
+// NOTE: These constants are intentionally duplicated from content.js.
+// Content scripts and Options pages run in separate browser contexts,
+// so a shared module is not possible without a bundler. Keep these in sync
+// if you add or remove sound files.
 const AVAILABLE_SOUNDS = ['pop.wav', 'chime.wav', 'success.wav'];
 
+// Storage key shared with content.js — must match exactly.
 const STORAGE_KEY = 'ctrSettings';
 
 /* ------------------------------------------------------------------ */
