@@ -264,10 +264,17 @@ function safelyUpdateTextarea(el, newValue) {
 
 /**
  * Update text inside a contenteditable / [role="textbox"] element by
- * walking every Text node and applying rules individually, thereby
- * preserving the rich-text DOM structure (paragraphs, spans, marks) that
- * ProseMirror / Slate editors rely on.  A single bubbling "input" event is
- * dispatched after all mutations so the host framework can re-sync.
+ * simulating a user selecting all content and typing the replacement.
+ *
+ * This avoids direct text-node / nodeValue mutation (which bypasses
+ * ProseMirror / Slate state management and breaks the editor).  Instead we:
+ *   1. Read the current user-visible text via innerText.
+ *   2. Compute the replacement with applyRulesToText.
+ *   3. If changed, focus the element, select all its content, then call
+ *      document.execCommand('insertText') — the same operation the browser
+ *      performs when a real user selects all and types.  This fires the
+ *      InputEvent chain that the host editor listens to, so its internal
+ *      state is updated correctly.
  *
  * A per-element processing lock prevents concurrent mutations on the same
  * editor node.
@@ -280,32 +287,48 @@ function safelyUpdateContentEditable(el, rules, counts) {
   if (processingElements.has(el)) return;
   processingElements.add(el);
   try {
-    // Collect all text nodes first so the walker is not invalidated by
-    // in-place nodeValue mutations.
-    const textNodes = [];
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
-    let node = walker.nextNode();
-    while (node) {
-      textNodes.push(node);
-      node = walker.nextNode();
+    // innerText gives the user-visible text with proper line breaks;
+    // 'innerText' in el guards against SVG/non-HTML elements that lack it.
+    const original = ('innerText' in el ? el.innerText : el.textContent) || '';
+    if (!original) return;
+
+    // Idempotency: skip if the extension already set this exact text last cycle.
+    const lastVal = lastAppliedValues.get(el);
+    if (lastVal !== undefined && lastVal === original) return;
+
+    // Compute replacement using a temporary counts array so we only merge
+    // increments into the shared `counts` after a successful DOM update.
+    const tempCounts = new Array(counts.length).fill(0);
+    const updated = applyRulesToText(original, rules, tempCounts);
+    if (updated === original) return;
+
+    const wasFocused = document.activeElement === el;
+    if (!wasFocused) el.focus({ preventScroll: true });
+
+    // Select all content within the element so that execCommand replaces it.
+    const sel = window.getSelection();
+    if (sel) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
     }
 
-    let anyChanged = false;
-    for (const textNode of textNodes) {
-      const original = textNode.nodeValue;
-      const updated  = applyRulesToText(original, rules, counts);
-      if (updated !== original) {
-        textNode.nodeValue = updated;
-        anyChanged = true;
-      }
+    // execCommand('insertText') is deprecated per the HTML spec but remains
+    // the only reliable way to inject text into a contenteditable element
+    // through the browser's own input pipeline.  Modern alternatives (e.g. the
+    // Clipboard API or manual InputEvent dispatch) do not cause ProseMirror /
+    // Slate to reconcile their state correctly.  This call behaves identically
+    // to a real user pressing Ctrl+A then typing — which is the desired goal.
+    const succeeded = document.execCommand('insertText', false, updated);
+
+    if (succeeded) {
+      // Merge counts only on confirmed DOM update.
+      for (let i = 0; i < counts.length; i++) counts[i] += tempCounts[i];
+      lastAppliedValues.set(el, updated);
     }
 
-    // Notify the framework of the change without firing beforeinput here,
-    // since the DOM mutation has already occurred and ProseMirror / Slate
-    // will reconcile from the input event.
-    if (anyChanged) {
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: false }));
-    }
+    if (!wasFocused) el.blur();
   } finally {
     processingElements.delete(el);
   }
@@ -316,7 +339,8 @@ function safelyUpdateContentEditable(el, rules, counts) {
  * type.  For input/textarea, applies all rules at once to the full value
  * string and delegates to safelyUpdateInput / safelyUpdateTextarea.
  * For contenteditable / role="textbox", delegates to
- * safelyUpdateContentEditable which walks inner text nodes.
+ * safelyUpdateContentEditable which uses select-all + execCommand('insertText')
+ * to simulate a real user edit.
  *
  * An idempotency check (lastAppliedValues) skips input/textarea fields
  * whose value has not changed since the extension last wrote to them.
@@ -357,68 +381,13 @@ function replaceInEditableElement(el, rules, counts) {
 }
 
 /**
- * Walk all text nodes in `root` that are NOT inside an editable field
- * (those are handled by the sequential editable-field loop in
- * runReplacementScan) and apply the active rules to each.
- *
- * @param {Element} root
- * @param {Array}   rules
- * @param {number[]} counts
- */
-function replaceInVisibleTextNodes(root, rules, counts) {
-  const walker = document.createTreeWalker(
-    root,
-    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        if (isInsideExtensionUI(node)) return NodeFilter.FILTER_REJECT;
-
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          if (shouldSkipElement(node)) return NodeFilter.FILTER_REJECT;
-          // Skip editable subtrees — already handled by the editable-field loop
-          if (
-            node.tagName === 'TEXTAREA' ||
-            node.tagName === 'INPUT' ||
-            node.getAttribute('contenteditable') === 'true' ||
-            node.getAttribute('role') === 'textbox'
-          ) return NodeFilter.FILTER_REJECT;
-          return NodeFilter.FILTER_SKIP;
-        }
-
-        // Text node — accept
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    },
-  );
-
-  // Collect before iterating so in-place mutations don't confuse the walker
-  const textNodes = [];
-  let node = walker.nextNode();
-  while (node) {
-    textNodes.push(node);
-    node = walker.nextNode();
-  }
-
-  for (const textNode of textNodes) {
-    const original = textNode.nodeValue;
-    const updated  = applyRulesToText(original, rules, counts);
-    if (updated !== original) {
-      textNode.nodeValue = updated;
-    }
-  }
-}
-
-/**
  * Run a full scan of the page and return a structured result.
  *
- * Pass 1 — editable fields processed ONE AT A TIME with a queueMicrotask
+ * Editable fields are processed ONE AT A TIME with a queueMicrotask
  * yield between each field.  Processing one field at a time means React
  * can reconcile each individual update before the next mutation begins,
  * avoiding conflicting intermediate states and preventing one field's
  * change from destabilising another.
- *
- * Pass 2 — all remaining visible text nodes outside editable fields,
- * updated synchronously after all editable fields are done.
  *
  * @returns {Promise<{ totalReplacements: number, rules: Array }>}
  */
@@ -434,7 +403,7 @@ async function runReplacementScan() {
     return { totalReplacements: 0, rules: buildResultRules(counts) };
   }
 
-  // Pass 1: process every editable field sequentially.  The microtask yield
+  // Process every editable field sequentially.  The microtask yield
   // between fields keeps updates deterministic without introducing noticeable
   // delay to the user.
   const fields = Array.from(document.querySelectorAll(EDITABLE_SELECTOR));
@@ -445,9 +414,6 @@ async function runReplacementScan() {
     // state updates triggered by the previous field before we touch the next.
     await Promise.resolve();
   }
-
-  // Pass 2: remaining visible text nodes (skips editable subtrees)
-  replaceInVisibleTextNodes(document.body, rules, counts);
 
   const totalReplacements = counts.reduce((sum, n) => sum + n, 0);
   return { totalReplacements, rules: buildResultRules(counts) };
