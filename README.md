@@ -8,12 +8,17 @@ It injects a small overlay UI in the top-right corner and re-runs on every DOM c
 ## Features
 
 - **3 configurable find / replace rules** — each can be independently enabled or disabled.
-- **Auto-run on page load** and on every DOM mutation (Contentful is a SPA — new content appears without a full page reload).
-- **MutationObserver** with 400 ms debounce keeps performance impact minimal.
-- **Toast notification** summarises how many replacements were made and which rules fired.
+- **Auto-run on page load** — waits ~1500 ms after page load (configurable `INITIAL_DELAY` constant) to let Contentful's React SPA finish rendering, then retries until editable fields are present.
+- **MutationObserver** with 400 ms debounce + 400 ms reaction delay keeps performance impact minimal while still catching dynamically loaded content.
+- **Covers all Contentful editable fields**:
+  - `<textarea>`
+  - `<input type="text">` / `<input>` (no type)
+  - `[contenteditable="true"]`
+  - `[role="textbox"]`
+- **React-compatible value updates** — uses the native `HTMLInputElement.prototype.value` setter and dispatches `input` + `change` events so React's internal state stays in sync.
+- **Toast notification** summarises how many replacements were made and which rules fired (only shown when at least one replacement occurs).
 - **Persistent settings** stored in `chrome.storage.sync` — survive browser restarts and sync across Chrome profiles.
 - **Draggable overlay** — grab the title bar and drag it anywhere on screen.
-- Works with React-controlled `<input>` / `<textarea>` elements by dispatching native `input` and `change` events.
 
 ---
 
@@ -60,7 +65,7 @@ It injects a small overlay UI in the top-right corner and re-runs on every DOM c
 
 ### Running replacements
 
-Replacements run **automatically** every time the page changes.  You can also:
+Replacements run **automatically** ~1–2 seconds after each page load and on every subsequent DOM change.  You can also:
 
 - Click **Run now** to trigger an immediate scan.
 - Watch the **status line** below the rules for a summary of the last scan.
@@ -74,15 +79,13 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 
 ## How it works (technical summary)
 
-1. **On load** — settings are loaded from `chrome.storage.sync`.  If globally enabled, an initial scan runs 600 ms after page load to let Contentful finish rendering.
-2. **MutationObserver** watches `document.body` for any DOM changes.  After 400 ms of silence, a fresh scan runs automatically.
-3. **Replacement engine** walks the DOM with a `TreeWalker`, skipping `<script>`, `<style>`, `<noscript>` tags and the extension's own UI elements.  It replaces text in:
-   - visible text nodes
-   - `<textarea>` values
-   - `<input type="text">` values
-   - contenteditable regions (via text nodes)
-4. **React compatibility** — input values are updated via the native `HTMLInputElement.prototype.value` setter and synthetic `input` / `change` events are dispatched so React re-syncs its internal state.
-5. **Anti-loop guard** — the observer is disconnected during a scan and reconnected immediately after, preventing the extension's own DOM writes from triggering a new scan.
+1. **On load** — settings are loaded from `chrome.storage.sync`.  If globally enabled, after `INITIAL_DELAY` (1500 ms) the extension calls `waitAndRunInitialScan()`, which checks whether editable fields are present and retries up to 5 times (every 800 ms) if not.
+2. **MutationObserver** watches `document.body` for any DOM changes.  After 400 ms of silence (debounce) plus an additional 400 ms reaction delay, a fresh scan runs automatically.
+3. **Replacement engine** (`runReplacementScan`):
+   - **Pass 1 — editable fields** (`replaceInEditableElements`): scans every `textarea`, `input[type="text"]`, `input` (no type), `[contenteditable="true"]`, and `[role="textbox"]` element.
+   - **Pass 2 — visible text nodes**: a `TreeWalker` handles any remaining text outside of editable fields.
+4. **React compatibility** — `setNativeValue()` sets input values via the native `HTMLInputElement.prototype.value` setter and dispatches synthetic `input` / `change` events so React re-syncs its internal state.  `contenteditable` elements are updated via `innerText` with an `input` event.
+5. **Anti-loop guard** — the MutationObserver is disconnected during a scan and reconnected immediately after, and a `scanInProgress` flag prevents concurrent scans.
 
 ---
 
