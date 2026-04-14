@@ -331,7 +331,8 @@ function replaceInEditableElement(el, rules, counts) {
   if (tag === 'TEXTAREA') {
     const original = el.value;
     // Skip if the extension already set this exact value (prevents pointless re-renders)
-    if (lastAppliedValues.has(el) && lastAppliedValues.get(el) === original) return;
+    const lastTA = lastAppliedValues.get(el);
+    if (lastTA !== undefined && lastTA === original) return;
     const updated = applyRulesToText(original, rules, counts);
     if (updated !== original) safelyUpdateTextarea(el, updated);
     return;
@@ -339,7 +340,8 @@ function replaceInEditableElement(el, rules, counts) {
 
   if (tag === 'INPUT' && (type === 'text' || type === '')) {
     const original = el.value;
-    if (lastAppliedValues.has(el) && lastAppliedValues.get(el) === original) return;
+    const lastIn = lastAppliedValues.get(el);
+    if (lastIn !== undefined && lastIn === original) return;
     const updated = applyRulesToText(original, rules, counts);
     if (updated !== original) safelyUpdateInput(el, updated);
     return;
@@ -440,7 +442,7 @@ async function runReplacementScan() {
     replaceInEditableElement(field, rules, counts);
     // Yield to the microtask queue so the event loop can process React
     // state updates triggered by the previous field before we touch the next.
-    await new Promise(resolve => queueMicrotask(resolve));
+    await Promise.resolve();
   }
 
   // Pass 2: remaining visible text nodes (skips editable subtrees)
