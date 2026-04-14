@@ -1,7 +1,8 @@
 # Contentful Text Replacer
 
 A lightweight Chrome extension (Manifest V3) that automatically finds and replaces text on Contentful pages.  
-It injects a small overlay UI in the top-right corner and re-runs on every DOM change so you never have to click "Replace" manually.
+It injects a small overlay UI in the top-right corner and re-runs on every DOM change so you never have to click "Replace" manually.  
+When replacements are made it plays a short bundled sound effect and fires a confetti particle burst around the toast notification.
 
 ---
 
@@ -17,6 +18,8 @@ It injects a small overlay UI in the top-right corner and re-runs on every DOM c
   - `[role="textbox"]`
 - **React-compatible value updates** — uses the native `HTMLInputElement.prototype.value` setter and dispatches `input` + `change` events so React's internal state stays in sync.
 - **Toast notification** summarises how many replacements were made and which rules fired (only shown when at least one replacement occurs).
+- **Confetti celebration** — colourful particle burst radiates from the toast on every successful scan.
+- **Sound effects** — plays a bundled `.wav` file when replacements are made.  Throttled to once per 1500 ms so rapid MutationObserver re-scans don't spam the audio.  Can be toggled on/off and the file can be chosen from a dropdown in the overlay.
 - **Persistent settings** stored in `chrome.storage.sync` — survive browser restarts and sync across Chrome profiles.
 - **Draggable overlay** — grab the title bar and drag it anywhere on screen.
 
@@ -24,12 +27,15 @@ It injects a small overlay UI in the top-right corner and re-runs on every DOM c
 
 ## Files
 
-| File           | Purpose |
-|----------------|---------|
+| Path | Purpose |
+|------|---------|
 | `manifest.json` | Extension manifest (Manifest V3) |
-| `content.js`    | All extension logic — overlay UI, replacement engine, MutationObserver, toast |
-| `content.css`   | Styles for the overlay and toast |
-| `README.md`     | This file |
+| `content.js` | All extension logic — overlay UI, replacement engine, MutationObserver, toast, sound, confetti |
+| `content.css` | Styles for the overlay, toast, and confetti particles |
+| `assets/sounds/pop.wav` | Short percussive pop sound |
+| `assets/sounds/chime.wav` | Bell-like chime sound |
+| `assets/sounds/success.wav` | Ascending C–E–G arpeggio |
+| `README.md` | This file |
 
 ---
 
@@ -39,7 +45,6 @@ It injects a small overlay UI in the top-right corner and re-runs on every DOM c
 
    ```bash
    git clone https://github.com/MikkelGjessing/Search-and-deploy.git
-   # The repository is named "Search-and-deploy" and contains the Contentful Text Replacer extension.
    ```
 
 2. Open Chrome and go to **`chrome://extensions`**.
@@ -70,6 +75,15 @@ Replacements run **automatically** ~1–2 seconds after each page load and on ev
 - Click **Run now** to trigger an immediate scan.
 - Watch the **status line** below the rules for a summary of the last scan.
 - A **toast popup** (top-right, to the left of the overlay) fades in briefly after each scan that made at least one replacement.
+- A **confetti burst** animates around the toast each time replacements are made.
+
+### Sound effects
+
+- The **Sound effects** checkbox in the overlay enables or disables audio feedback.
+- Use the **sound file dropdown** next to the toggle to choose between `pop.wav`, `chime.wav`, and `success.wav`.
+- Click **Save** to persist your choice.
+- If the browser blocks autoplay (common when the extension triggers automatically without a prior user gesture), click **🔊 Unlock audio** once.  This performs a user-gesture-triggered play that grants permission for future automatic plays.
+- Sound is throttled: the selected file can play at most once every 1500 ms even if multiple replacement scans fire in quick succession.  The toast and confetti still appear on every successful scan regardless of throttling.
 
 ### Global enable / disable
 
@@ -88,6 +102,18 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 5. **ProseMirror / Slate compatibility** — `replaceInContentEditable()` uses a `TreeWalker` to update individual `Text` nodes inside the editor element rather than overwriting `innerText`, which would destroy the rich-text DOM structure and trigger editor resets.  A single `input` event is dispatched on the element after all its text nodes are updated.
 6. **`applyRulesToText(text, rules, counts)`** — shared helper used by all replacement functions.  Applies every active rule with a global (`g`) regex so every occurrence inside a string is replaced, not just the first.
 7. **Anti-loop guard** — the MutationObserver is disconnected during a scan and reconnected immediately after, and a `scanInProgress` flag prevents concurrent scans.
+8. **Sound playback** — `tryPlaySuccessSound()` builds the sound URL with `chrome.runtime.getURL('assets/sounds/<file>')`, instantiates an `Audio` object, and calls `.play()`.  Errors (e.g. autoplay restrictions) are silently caught so they never break replacements or animations.  A `lastSoundPlayedAt` timestamp guard enforces the 1500 ms throttle.
+9. **Confetti** — `spawnCelebrationParticles()` appends `<div class="ctr-particle">` elements to `document.documentElement` with CSS custom properties `--ctr-dx` / `--ctr-dy` that drive the keyframe animation.  Particles remove themselves via `animationend`.
+
+---
+
+## Adding or replacing sound files
+
+1. Drop a new `.wav` file into `assets/sounds/`.
+2. Add the filename to the `AVAILABLE_SOUNDS` array near the top of `content.js`.
+3. Reload the extension in `chrome://extensions`.
+
+The `web_accessible_resources` entry in `manifest.json` already grants the content script access to all `assets/sounds/*.wav` files.
 
 ---
 
@@ -96,6 +122,8 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 ```json
 {
   "enabled": true,
+  "soundEnabled": true,
+  "selectedSoundFile": "pop.wav",
   "rules": [
     { "findText": "Old brand", "replaceText": "New brand", "enabled": true },
     { "findText": "Draft",     "replaceText": "Published", "enabled": true },
@@ -113,3 +141,4 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 | `storage`  | Saves and loads your find/replace rules via `chrome.storage.sync` |
 
 No network access, no tab permissions, no host permissions beyond Contentful URLs.
+

@@ -7,6 +7,7 @@
  *  3. Waits ~1500 ms after page load, then runs the first replacement scan.
  *  4. Runs find-and-replace on every DOM mutation (debounced).
  *  5. Shows a fading toast after each scan that made replacements.
+ *  6. Plays a bundled sound effect and spawns confetti when replacements are made.
  *
  * Only runs on app.contentful.com (and *.contentful.com) pages.
  */
@@ -24,6 +25,14 @@ const INITIAL_DELAY           = 1500;   // delay before first auto-scan (lets Co
 const RETRY_DELAY_MS          = 800;    // retry interval when editable fields are not yet present
 const MAX_RETRIES             = 5;      // max number of retries on initial scan
 const NUM_RULES               = 3;
+const SOUND_THROTTLE_MS       = 1500;   // minimum ms between successive sound plays
+const PARTICLE_COUNT          = 22;     // number of confetti particles per celebration
+
+// Bundled sound files in assets/sounds/
+const AVAILABLE_SOUNDS = ['pop.wav', 'chime.wav', 'success.wav'];
+
+// Confetti particle colours
+const PARTICLE_COLORS = ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#f97316', '#ec4899'];
 
 // Selector for all Contentful editable fields
 const EDITABLE_SELECTOR = [
@@ -41,9 +50,11 @@ const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'HEAD', 'META', 'LINK'
 /*  State                                                               */
 /* ------------------------------------------------------------------ */
 
-/** @type {{ enabled: boolean, rules: Array<{findText:string, replaceText:string, enabled:boolean}> }} */
+/** @type {{ enabled: boolean, soundEnabled: boolean, selectedSoundFile: string, rules: Array<{findText:string, replaceText:string, enabled:boolean}> }} */
 let settings = {
-  enabled: true,
+  enabled:           true,
+  soundEnabled:      true,
+  selectedSoundFile: 'pop.wav',
   rules: Array.from({ length: NUM_RULES }, () => ({
     findText:    '',
     replaceText: '',
@@ -55,6 +66,7 @@ let mutationObserver  = null;   // MutationObserver instance
 let debounceTimer     = null;   // debounce timeout id
 let scanInProgress    = false;  // guard against re-entrant scans
 let toastTimer        = null;   // timeout id for hiding the toast
+let lastSoundPlayedAt = 0;      // timestamp of last sound play (for throttle)
 
 /* ------------------------------------------------------------------ */
 /*  Helpers — text escaping                                             */
@@ -367,6 +379,86 @@ function buildResultRules(counts) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Sound helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Build the chrome-extension:// URL for the currently selected sound file.
+ *
+ * @returns {string}
+ */
+function getSelectedSoundUrl() {
+  return chrome.runtime.getURL(`assets/sounds/${settings.selectedSoundFile}`);
+}
+
+/**
+ * Play the selected bundled sound if sound is enabled and the throttle
+ * window has elapsed.  Errors from autoplay restrictions are silently
+ * swallowed so they never break replacements or animations.
+ */
+function tryPlaySuccessSound() {
+  if (!settings.soundEnabled) return;
+  const now = Date.now();
+  if (now - lastSoundPlayedAt < SOUND_THROTTLE_MS) return;
+  lastSoundPlayedAt = now;
+
+  const audio = new Audio(getSelectedSoundUrl());
+  audio.volume = 0.7;
+  audio.play().catch(() => { /* autoplay blocked — ignore */ });
+}
+
+/**
+ * Unlock future autoplay by playing the current sound at near-zero volume
+ * in direct response to a user gesture (the "Unlock audio" button click).
+ */
+function unlockAudio() {
+  const audio = new Audio(getSelectedSoundUrl());
+  audio.volume = 0.01;
+  audio.play().then(() => {
+    audio.pause();
+  }).catch(() => { /* still blocked — nothing to do */ });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Celebration particles                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Spawn PARTICLE_COUNT confetti particles that burst outward from the
+ * centre of the toast element, then remove themselves when the CSS
+ * animation ends.
+ */
+function spawnCelebrationParticles() {
+  const toast = document.getElementById(TOAST_ID);
+  if (!toast) return;
+
+  const rect    = toast.getBoundingClientRect();
+  const centerX = rect.left + rect.width  / 2;
+  const centerY = rect.top  + rect.height / 2;
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const particle = document.createElement('div');
+    particle.className = 'ctr-particle';
+
+    const angle    = (i / PARTICLE_COUNT) * 360;
+    const distance = 45 + Math.random() * 65;
+    const dx       = Math.cos((angle * Math.PI) / 180) * distance;
+    const dy       = Math.sin((angle * Math.PI) / 180) * distance;
+    const size     = 5 + Math.random() * 6;
+    const color    = PARTICLE_COLORS[i % PARTICLE_COLORS.length];
+
+    particle.style.cssText =
+      `left:${centerX}px;top:${centerY}px;` +
+      `width:${size}px;height:${size}px;` +
+      `background:${color};` +
+      `--ctr-dx:${dx}px;--ctr-dy:${dy}px;`;
+
+    document.documentElement.appendChild(particle);
+    particle.addEventListener('animationend', () => particle.remove(), { once: true });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Toast notification                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -479,6 +571,12 @@ function executeScan() {
     const result = runReplacementScan();
     updateStatus(result);
     showScanSummaryToast(result);
+
+    if (result.totalReplacements > 0) {
+      // Wait one animation frame so the toast is laid out before we read its rect
+      requestAnimationFrame(() => spawnCelebrationParticles());
+      tryPlaySuccessSound();
+    }
   } finally {
     scanInProgress = false;
     // Reconnect after the synchronous scan is done
@@ -573,6 +671,10 @@ function buildOverlayHTML() {
       </div>`;
   }
 
+  const soundOptions = AVAILABLE_SOUNDS
+    .map(f => `<option value="${f}">${f}</option>`)
+    .join('');
+
   return `
     <div id="ctr-overlay-header">
       <span id="ctr-overlay-title">Text Replacer</span>
@@ -580,6 +682,16 @@ function buildOverlayHTML() {
         <input type="checkbox" id="ctr-global-toggle" />
         Active
       </label>
+    </div>
+    <div id="ctr-sound-section">
+      <div id="ctr-sound-row">
+        <label id="ctr-sound-toggle-label" title="Play a sound when replacements are made">
+          <input type="checkbox" id="ctr-sound-toggle" />
+          Sound effects
+        </label>
+        <select id="ctr-sound-select" title="Choose sound file">${soundOptions}</select>
+      </div>
+      <button class="ctr-btn" id="ctr-unlock-audio-btn" title="Click to allow sound playback">🔊 Unlock audio</button>
     </div>
     <div id="ctr-rules">${rulesHTML}</div>
     <div id="ctr-status">Not yet run</div>
@@ -595,6 +707,12 @@ function buildOverlayHTML() {
 function syncOverlayFromSettings() {
   const globalToggle = document.getElementById('ctr-global-toggle');
   if (globalToggle) globalToggle.checked = settings.enabled;
+
+  const soundToggle = document.getElementById('ctr-sound-toggle');
+  if (soundToggle) soundToggle.checked = settings.soundEnabled;
+
+  const soundSelect = document.getElementById('ctr-sound-select');
+  if (soundSelect) soundSelect.value = settings.selectedSoundFile;
 
   for (let i = 0; i < NUM_RULES; i++) {
     const rule     = settings.rules[i];
@@ -614,6 +732,14 @@ function syncSettingsFromOverlay() {
   const globalToggle = document.getElementById('ctr-global-toggle');
   if (globalToggle) settings.enabled = globalToggle.checked;
 
+  const soundToggle = document.getElementById('ctr-sound-toggle');
+  if (soundToggle) settings.soundEnabled = soundToggle.checked;
+
+  const soundSelect = document.getElementById('ctr-sound-select');
+  if (soundSelect && AVAILABLE_SOUNDS.includes(soundSelect.value)) {
+    settings.selectedSoundFile = soundSelect.value;
+  }
+
   for (let i = 0; i < NUM_RULES; i++) {
     const findEl  = document.querySelector(`.ctr-find[data-rule="${i}"]`);
     const replEl  = document.querySelector(`.ctr-replace[data-rule="${i}"]`);
@@ -630,8 +756,9 @@ function syncSettingsFromOverlay() {
  * @param {HTMLElement} overlay
  */
 function attachOverlayListeners(overlay) {
-  const saveBtn = overlay.querySelector('#ctr-save-btn');
-  const runBtn  = overlay.querySelector('#ctr-run-btn');
+  const saveBtn        = overlay.querySelector('#ctr-save-btn');
+  const runBtn         = overlay.querySelector('#ctr-run-btn');
+  const unlockAudioBtn = overlay.querySelector('#ctr-unlock-audio-btn');
 
   saveBtn.addEventListener('click', () => {
     syncSettingsFromOverlay();
@@ -641,6 +768,11 @@ function attachOverlayListeners(overlay) {
   runBtn.addEventListener('click', () => {
     syncSettingsFromOverlay();
     executeScan();
+  });
+
+  unlockAudioBtn.addEventListener('click', () => {
+    syncSettingsFromOverlay();
+    unlockAudio();
   });
 }
 
@@ -712,6 +844,13 @@ function loadSettings() {
         // Merge top-level keys
         if (typeof stored.enabled === 'boolean') {
           settings.enabled = stored.enabled;
+        }
+        if (typeof stored.soundEnabled === 'boolean') {
+          settings.soundEnabled = stored.soundEnabled;
+        }
+        if (typeof stored.selectedSoundFile === 'string' &&
+            AVAILABLE_SOUNDS.includes(stored.selectedSoundFile)) {
+          settings.selectedSoundFile = stored.selectedSoundFile;
         }
         if (Array.isArray(stored.rules)) {
           stored.rules.forEach((r, i) => {
