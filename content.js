@@ -113,7 +113,7 @@ function shouldSkipElement(el) {
  *
  * @returns {Array<{index:number, findText:string, replaceText:string, regex:RegExp}>}
  */
-function buildActiveRules() {
+function getActiveRules() {
   if (!settings.enabled) return [];
   return settings.rules
     .map((rule, index) => ({ ...rule, index }))
@@ -128,32 +128,25 @@ function buildActiveRules() {
 }
 
 /**
- * Replace text within a single text node.
+ * Apply every active rule to `text`, replacing ALL occurrences of each
+ * find string.  Updates `counts[rule.index]` for each replacement made.
+ * Returns the fully-replaced string.
  *
- * @param {Text}   textNode
- * @param {Array}  activeRules
- * @param {Array}  counts  — per-rule replacement counter array (mutated in place)
- * @returns {number}  total replacements made in this node
+ * @param {string} text
+ * @param {Array}  rules   — active rules array from getActiveRules()
+ * @param {number[]} counts — per-rule replacement counter (mutated in place)
+ * @returns {string}
  */
-function replaceInTextNode(textNode, activeRules, counts) {
-  let text     = textNode.nodeValue;
-  let replaced = 0;
-
-  for (const rule of activeRules) {
-    const before = text;
+function applyRulesToText(text, rules, counts) {
+  for (const rule of rules) {
     text = text.replace(rule.regex, () => {
-      replaced++;
       counts[rule.index]++;
       return rule.replaceText;
     });
-    // Reset lastIndex in case the regex is reused (stateful 'g' flag)
+    // Reset lastIndex so the stateful 'g' regex is safe to reuse
     rule.regex.lastIndex = 0;
-    // Restore nodeValue only when something actually changed
-    if (text !== before) {
-      textNode.nodeValue = text;
-    }
   }
-  return replaced;
+  return text;
 }
 
 /**
@@ -175,119 +168,92 @@ function setNativeValue(el, value) {
 }
 
 /**
- * Replace text in a textarea or text <input> by updating its value
- * via the native setter so React (and other framework) controlled
- * inputs pick up the change.
+ * Replace text in a React-controlled <input type="text"> by applying ALL
+ * active rules in one pass, then committing the result via the native
+ * setter in a single call (one React re-render, not one per rule).
  *
- * @param {HTMLInputElement|HTMLTextAreaElement} el
- * @param {Array}  activeRules
- * @param {Array}  counts
- * @returns {number}
+ * @param {HTMLInputElement} el
+ * @param {Array}   rules
+ * @param {number[]} counts
  */
-function replaceInInput(el, activeRules, counts) {
-  let value    = el.value;
-  let replaced = 0;
-
-  for (const rule of activeRules) {
-    const before = value;
-    value = value.replace(rule.regex, () => {
-      replaced++;
-      counts[rule.index]++;
-      return rule.replaceText;
-    });
-    rule.regex.lastIndex = 0;
-    if (value !== before) {
-      setNativeValue(el, value);
-    }
+function replaceInInputValue(el, rules, counts) {
+  const original = el.value;
+  const updated  = applyRulesToText(original, rules, counts);
+  if (updated !== original) {
+    setNativeValue(el, updated);
   }
-  return replaced;
 }
 
 /**
- * Replace text inside a contenteditable element or role="textbox" element.
- * Updates innerText directly and dispatches an input event so React/Slate/
- * ProseMirror editors re-sync their internal state.
+ * Replace text in a React-controlled <textarea> by applying ALL active
+ * rules in one pass, then committing via the native setter.
+ *
+ * @param {HTMLTextAreaElement} el
+ * @param {Array}   rules
+ * @param {number[]} counts
+ */
+function replaceInTextareaValue(el, rules, counts) {
+  const original = el.value;
+  const updated  = applyRulesToText(original, rules, counts);
+  if (updated !== original) {
+    setNativeValue(el, updated);
+  }
+}
+
+/**
+ * Replace text inside a contenteditable / role="textbox" element by
+ * walking every text node WITHIN the element and updating each one
+ * individually.  This approach preserves the rich-text DOM structure
+ * (paragraphs, spans, marks) that ProseMirror / Slate editors use,
+ * instead of collapsing the entire content to a flat string via
+ * innerText which would lose formatting and trigger editor resets.
+ * A single bubbling "input" event is dispatched on the element after
+ * all text nodes have been updated so the host framework can re-sync.
  *
  * @param {Element} el
- * @param {Array}  activeRules
- * @param {Array}  counts
- * @returns {number}
+ * @param {Array}   rules
+ * @param {number[]} counts
  */
-function replaceInContentEditable(el, activeRules, counts) {
-  let text     = el.innerText !== undefined ? el.innerText : el.textContent;
-  let replaced = 0;
+function replaceInContentEditable(el, rules, counts) {
+  // Collect all text nodes inside the element first, so the walker is not
+  // invalidated by in-place nodeValue mutations.
+  const textNodes = [];
+  const walker = document.createTreeWalker(
+    el,
+    NodeFilter.SHOW_TEXT,
+    null,
+  );
+  let node = walker.nextNode();
+  while (node) {
+    textNodes.push(node);
+    node = walker.nextNode();
+  }
 
-  for (const rule of activeRules) {
-    const before = text;
-    text = text.replace(rule.regex, () => {
-      replaced++;
-      counts[rule.index]++;
-      return rule.replaceText;
-    });
-    rule.regex.lastIndex = 0;
-    if (text !== before) {
-      // Prefer innerText so line breaks are preserved
-      if (el.innerText !== undefined) {
-        el.innerText = text;
-      } else {
-        el.textContent = text;
-      }
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+  let anyChanged = false;
+  for (const textNode of textNodes) {
+    const original = textNode.nodeValue;
+    const updated  = applyRulesToText(original, rules, counts);
+    if (updated !== original) {
+      textNode.nodeValue = updated;
+      anyChanged = true;
     }
   }
-  return replaced;
+
+  if (anyChanged) {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 }
 
 /**
- * Find all editable fields in the page (inputs, textareas, contenteditable,
- * role="textbox") and apply the active replacement rules to each.
- *
- * @param {Array} activeRules
- * @param {Array} counts
- * @returns {number} total replacements made
- */
-function replaceInEditableElements(activeRules, counts) {
-  let total = 0;
-  const fields = document.querySelectorAll(EDITABLE_SELECTOR);
-  for (const field of fields) {
-    if (isInsideExtensionUI(field)) continue;
-    const tag  = field.tagName;
-    const type = (field.getAttribute('type') || '').toLowerCase();
-    if (
-      tag === 'TEXTAREA' ||
-      tag === 'INPUT' && (type === 'text' || type === '')
-    ) {
-      total += replaceInInput(field, activeRules, counts);
-    } else if (
-      field.getAttribute('contenteditable') === 'true' ||
-      field.getAttribute('role') === 'textbox'
-    ) {
-      total += replaceInContentEditable(field, activeRules, counts);
-    }
-  }
-  return total;
-}
-
-/**
- * Walk the DOM subtree rooted at `root` and apply all active rules.
- * Prioritises editable fields (inputs, textareas, contenteditable) and
- * then falls back to visible text nodes for any remaining matches.
+ * Walk all text nodes in `root` that are NOT inside an editable field
+ * (those are handled by replaceInAllEditableElements) and apply the
+ * active rules to each.
  *
  * @param {Element} root
- * @param {Array}   activeRules
- * @param {Array}   counts
- * @returns {number} total replacements made
+ * @param {Array}   rules
+ * @param {number[]} counts
  */
-function walkAndReplace(root, activeRules, counts) {
-  if (isInsideExtensionUI(root))  return 0;
-  if (shouldSkipElement(root))    return 0;
-
-  let total = 0;
-
-  // --- Pass 1: editable fields (highest priority) ---
-  total += replaceInEditableElements(activeRules, counts);
-
-  // --- Pass 2: remaining visible text nodes ---
+function replaceInVisibleTextNodes(root, rules, counts) {
   const walker = document.createTreeWalker(
     root,
     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
@@ -296,12 +262,11 @@ function walkAndReplace(root, activeRules, counts) {
         if (isInsideExtensionUI(node)) return NodeFilter.FILTER_REJECT;
 
         if (node.nodeType === Node.ELEMENT_NODE) {
-          const tag = node.tagName;
-          if (SKIP_TAGS.has(tag)) return NodeFilter.FILTER_REJECT;
-          // Skip editable fields — already handled in pass 1
+          if (shouldSkipElement(node)) return NodeFilter.FILTER_REJECT;
+          // Skip editable subtrees — already handled by replaceInAllEditableElements
           if (
-            tag === 'TEXTAREA' ||
-            tag === 'INPUT' ||
+            node.tagName === 'TEXTAREA' ||
+            node.tagName === 'INPUT' ||
             node.getAttribute('contenteditable') === 'true' ||
             node.getAttribute('role') === 'textbox'
           ) return NodeFilter.FILTER_REJECT;
@@ -314,6 +279,7 @@ function walkAndReplace(root, activeRules, counts) {
     },
   );
 
+  // Collect before iterating so in-place mutations don't confuse the walker
   const textNodes = [];
   let node = walker.nextNode();
   while (node) {
@@ -322,27 +288,67 @@ function walkAndReplace(root, activeRules, counts) {
   }
 
   for (const textNode of textNodes) {
-    total += replaceInTextNode(textNode, activeRules, counts);
+    const original = textNode.nodeValue;
+    const updated  = applyRulesToText(original, rules, counts);
+    if (updated !== original) {
+      textNode.nodeValue = updated;
+    }
   }
+}
 
-  return total;
+/**
+ * Iterate over EVERY editable field on the page (input, textarea,
+ * contenteditable, role="textbox") and apply all active rules.
+ * No element is skipped, no result is capped.
+ *
+ * @param {Array}   rules
+ * @param {number[]} counts
+ */
+function replaceInAllEditableElements(rules, counts) {
+  const fields = document.querySelectorAll(EDITABLE_SELECTOR);
+  for (const field of fields) {
+    if (isInsideExtensionUI(field)) continue;
+    const tag  = field.tagName;
+    const type = (field.getAttribute('type') || '').toLowerCase();
+    if (tag === 'TEXTAREA') {
+      replaceInTextareaValue(field, rules, counts);
+    } else if (tag === 'INPUT' && (type === 'text' || type === '')) {
+      replaceInInputValue(field, rules, counts);
+    } else if (
+      field.getAttribute('contenteditable') === 'true' ||
+      field.getAttribute('role') === 'textbox'
+    ) {
+      replaceInContentEditable(field, rules, counts);
+    }
+  }
 }
 
 /**
  * Run a full scan of the page and return a structured result.
+ * Pass 1 — all editable fields (inputs, textareas, contenteditable elements).
+ * Pass 2 — all remaining visible text nodes outside editable fields.
+ * Both passes cover the ENTIRE page with no caps or early exits.
  *
  * @returns {{ totalReplacements: number, rules: Array }}
  */
 function runReplacementScan() {
-  const activeRules = buildActiveRules();
+  const rules  = getActiveRules();
   const counts = Array.from({ length: NUM_RULES }, () => 0);
 
-  if (activeRules.length === 0) {
+  if (rules.length === 0) {
     return { totalReplacements: 0, rules: buildResultRules(counts) };
   }
 
-  const total = walkAndReplace(document.body, activeRules, counts);
-  return { totalReplacements: total, rules: buildResultRules(counts) };
+  if (!isInsideExtensionUI(document.body) && !shouldSkipElement(document.body)) {
+    // Pass 1: all editable fields
+    replaceInAllEditableElements(rules, counts);
+
+    // Pass 2: remaining visible text nodes (skips editable subtrees)
+    replaceInVisibleTextNodes(document.body, rules, counts);
+  }
+
+  const totalReplacements = counts.reduce((sum, n) => sum + n, 0);
+  return { totalReplacements, rules: buildResultRules(counts) };
 }
 
 /**

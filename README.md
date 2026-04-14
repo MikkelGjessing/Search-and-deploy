@@ -80,12 +80,14 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 ## How it works (technical summary)
 
 1. **On load** — settings are loaded from `chrome.storage.sync`.  If globally enabled, after `INITIAL_DELAY` (1500 ms) the extension calls `waitAndRunInitialScan()`, which checks whether editable fields are present and retries up to 5 times (every 800 ms) if not.
-2. **MutationObserver** watches `document.body` for any DOM changes.  After 400 ms of silence (debounce) plus an additional 400 ms reaction delay, a fresh scan runs automatically.
+2. **MutationObserver** watches `document.body` for any DOM changes.  After 400 ms of silence (debounce) plus an additional 400 ms reaction delay, a fresh scan runs automatically.  Each triggered scan is always a **full-page** scan — there is no partial or incremental scan mode.
 3. **Replacement engine** (`runReplacementScan`):
-   - **Pass 1 — editable fields** (`replaceInEditableElements`): scans every `textarea`, `input[type="text"]`, `input` (no type), `[contenteditable="true"]`, and `[role="textbox"]` element.
-   - **Pass 2 — visible text nodes**: a `TreeWalker` handles any remaining text outside of editable fields.
-4. **React compatibility** — `setNativeValue()` sets input values via the native `HTMLInputElement.prototype.value` setter and dispatches synthetic `input` / `change` events so React re-syncs its internal state.  `contenteditable` elements are updated via `innerText` with an `input` event.
-5. **Anti-loop guard** — the MutationObserver is disconnected during a scan and reconnected immediately after, and a `scanInProgress` flag prevents concurrent scans.
+   - **Pass 1 — editable fields** (`replaceInAllEditableElements`): iterates every `textarea`, `input[type="text"]`, `input` (no type), `[contenteditable="true"]`, and `[role="textbox"]` element returned by `querySelectorAll` — no cap, no early exit.
+   - **Pass 2 — visible text nodes** (`replaceInVisibleTextNodes`): a `TreeWalker` handles any remaining text nodes outside of editable fields.
+4. **React compatibility** — `setNativeValue()` sets input/textarea values via the native prototype setter and dispatches `input` + `change` events so React re-syncs.  All active rules are applied to the local string first; `setNativeValue` is called **once** per element (not once per rule), avoiding unnecessary React re-renders mid-scan.
+5. **ProseMirror / Slate compatibility** — `replaceInContentEditable()` uses a `TreeWalker` to update individual `Text` nodes inside the editor element rather than overwriting `innerText`, which would destroy the rich-text DOM structure and trigger editor resets.  A single `input` event is dispatched on the element after all its text nodes are updated.
+6. **`applyRulesToText(text, rules, counts)`** — shared helper used by all replacement functions.  Applies every active rule with a global (`g`) regex so every occurrence inside a string is replaced, not just the first.
+7. **Anti-loop guard** — the MutationObserver is disconnected during a scan and reconnected immediately after, and a `scanInProgress` flag prevents concurrent scans.
 
 ---
 
