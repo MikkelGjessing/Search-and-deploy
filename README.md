@@ -19,7 +19,7 @@ When replacements are made it plays a short bundled sound effect and fires a con
 - **React-compatible value updates** — uses the native `HTMLInputElement.prototype.value` setter and dispatches `input` + `change` events so React's internal state stays in sync.
 - **Toast notification** summarises how many replacements were made and which rules fired (only shown when at least one replacement occurs).
 - **Confetti celebration** — colourful particle burst radiates from the toast on every successful scan.
-- **Sound effects** — plays a bundled `.wav` file when replacements are made.  Throttled to once per 1500 ms so rapid MutationObserver re-scans don't spam the audio.  Can be toggled on/off and the file can be chosen from a dropdown in the overlay.
+- **Sound effects** — plays a bundled `.wav` file when replacements are made.  Throttled to once per 1500 ms so rapid MutationObserver re-scans don't spam the audio.  Sound settings (enabled toggle, file selection, test button) live on the **extension Options page**.
 - **Persistent settings** stored in `chrome.storage.sync` — survive browser restarts and sync across Chrome profiles.
 - **Draggable overlay** — grab the title bar and drag it anywhere on screen.
 
@@ -32,6 +32,9 @@ When replacements are made it plays a short bundled sound effect and fires a con
 | `manifest.json` | Extension manifest (Manifest V3) |
 | `content.js` | All extension logic — overlay UI, replacement engine, MutationObserver, toast, sound, confetti |
 | `content.css` | Styles for the overlay, toast, and confetti particles |
+| `options.html` | Extension Options page (sound settings) |
+| `options.css` | Styles for the Options page |
+| `options.js` | Logic for loading, saving, and testing sound settings |
 | `assets/sounds/pop.wav` | Short percussive pop sound |
 | `assets/sounds/chime.wav` | Bell-like chime sound |
 | `assets/sounds/success.wav` | Ascending C–E–G arpeggio |
@@ -79,11 +82,15 @@ Replacements run **automatically** ~1–2 seconds after each page load and on ev
 
 ### Sound effects
 
-- The **Sound effects** checkbox in the overlay enables or disables audio feedback.
-- Use the **sound file dropdown** next to the toggle to choose between `pop.wav`, `chime.wav`, and `success.wav`.
-- Click **Save** to persist your choice.
-- If the browser blocks autoplay (common when the extension triggers automatically without a prior user gesture), click **🔊 Unlock audio** once.  This performs a user-gesture-triggered play that grants permission for future automatic plays.
-- Sound is throttled: the selected file can play at most once every 1500 ms even if multiple replacement scans fire in quick succession.  The toast and confetti still appear on every successful scan regardless of throttling.
+Sound settings are managed on the **extension Options page** — right-click the extension icon and choose **Options**, or open `chrome://extensions` and click the **Details** link next to the extension, then click **Extension options**.
+
+On the Options page you can:
+
+- Toggle sound effects on or off.
+- Choose the playback file (`pop.wav`, `chime.wav`, or `success.wav`).
+- Click **▶ Test sound** to verify playback immediately.
+
+Sound is throttled: the selected file plays at most once every 1500 ms even if multiple replacement scans fire in quick succession.  The toast and confetti still appear on every successful scan regardless of throttling.
 
 ### Global enable / disable
 
@@ -106,18 +113,18 @@ The **Active** checkbox in the overlay header disables all replacements at once 
 6. **Idempotency guard** — a `WeakMap` (`lastAppliedValues`) records the last value the extension wrote to each input/textarea.  If a field's current value matches the stored value, the extension skips it without dispatching any events, preventing pointless React re-renders on subsequent scans.
 7. **`isInternalUpdate` flag** — set to `true` for the entire duration of `executeScan` (including all async yields).  The MutationObserver callback checks this flag first and returns immediately if set, so extension-originated DOM mutations never schedule a re-scan.  The observer is also disconnected before the async scan starts and reconnected in the `finally` block for defence in depth.
 8. **`applyRulesToText(text, rules, counts)`** — shared helper used by all replacement functions.  Applies every active rule with a global (`g`) regex so every occurrence inside a string is replaced, not just the first.
-9. **Sound playback** — `tryPlaySuccessSound()` builds the sound URL with `chrome.runtime.getURL('assets/sounds/<file>')`, instantiates an `Audio` object, and calls `.play()`.  Errors (e.g. autoplay restrictions) are silently caught.  A `lastSoundPlayedAt` timestamp guard enforces the 1500 ms throttle.
+9. **Sound playback** — `tryPlaySuccessSound()` builds the sound URL with `chrome.runtime.getURL('assets/sounds/<file>')`, instantiates an `Audio` object, and calls `.play()`.  Errors (e.g. autoplay restrictions) are silently caught.  A `lastSoundPlayedAt` timestamp guard enforces the 1500 ms throttle.  Sound settings (enabled, file) are configured on the **Options page** and stored in `chrome.storage.sync`.
 10. **Confetti** — `spawnCelebrationParticles()` appends `<div class="ctr-particle">` elements to `document.documentElement` with CSS custom properties `--ctr-dx` / `--ctr-dy` that drive the keyframe animation.  Particles remove themselves via `animationend`.
 
 ---
 
 ## Adding or replacing sound files
 
-1. Drop a new `.wav` file into `assets/sounds/`.
-2. Add the filename to the `AVAILABLE_SOUNDS` array near the top of `content.js`.
+1. Drop a new `.wav` (or `.mp3`) file into `assets/sounds/`.
+2. Add the filename to the `AVAILABLE_SOUNDS` array near the top of both `content.js` **and** `options.js`.
 3. Reload the extension in `chrome://extensions`.
 
-The `web_accessible_resources` entry in `manifest.json` already grants the content script access to all `assets/sounds/*.wav` files.
+The `web_accessible_resources` entry in `manifest.json` already grants the content script access to all `assets/sounds/*.wav` and `assets/sounds/*.mp3` files.
 
 ---
 
@@ -142,7 +149,7 @@ The `web_accessible_resources` entry in `manifest.json` already grants the conte
 
 | Permission | Reason |
 |------------|--------|
-| `storage`  | Saves and loads your find/replace rules via `chrome.storage.sync` |
+| `storage`  | Saves and loads your find/replace rules and sound settings via `chrome.storage.sync` |
 
 No network access, no tab permissions, no host permissions beyond Contentful URLs.
 
