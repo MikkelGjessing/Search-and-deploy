@@ -68,6 +68,18 @@ let scanInProgress    = false;  // guard against re-entrant scans
 let toastTimer        = null;   // timeout id for hiding the toast
 let lastSoundPlayedAt = 0;      // timestamp of last sound play (for throttle)
 
+// True while the extension is writing to the DOM — the MutationObserver
+// callback skips reactions to changes made by the extension itself.
+let isInternalUpdate = false;
+
+// Per-element processing lock: prevents re-entering the update logic for
+// an element that is already being written (e.g. if events re-trigger a scan).
+const processingElements = new WeakSet();
+
+// Tracks the last value that the extension set on each input/textarea so
+// we can skip fields whose content has not changed since the last scan.
+const lastAppliedValues = new WeakMap();
+
 /* ------------------------------------------------------------------ */
 /*  Helpers — text escaping                                             */
 /* ------------------------------------------------------------------ */
@@ -162,104 +174,191 @@ function applyRulesToText(text, rules, counts) {
 }
 
 /**
- * Set the value of a React-controlled input/textarea using the native
- * prototype setter so React's internal state is updated, then dispatch
- * the required synthetic events.
+ * Capture selectionStart/selectionEnd, run `callback`, then restore the
+ * cursor position.  Safe to call on elements that do not support selection
+ * (errors are silently ignored).
  *
  * @param {HTMLInputElement|HTMLTextAreaElement} el
- * @param {string} value
+ * @param {Function} callback
  */
-function setNativeValue(el, value) {
-  const proto = el.tagName === 'TEXTAREA'
-    ? HTMLTextAreaElement.prototype
-    : HTMLInputElement.prototype;
-  const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-  nativeSetter.call(el, value);
-  el.dispatchEvent(new Event('input',  { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
+function preserveSelection(el, callback) {
+  let start = null;
+  let end   = null;
+  try { start = el.selectionStart; end = el.selectionEnd; } catch (_) { /* not selectable */ }
+  callback();
+  if (start !== null) {
+    try { el.setSelectionRange(start, end); } catch (_) { /* ignore */ }
+  }
 }
 
 /**
- * Replace text in a React-controlled <input type="text"> by applying ALL
- * active rules in one pass, then committing the result via the native
- * setter in a single call (one React re-render, not one per rule).
+ * Update an <input type="text"> (or no-type input) in a way that React's
+ * synthetic event system recognises as user input:
+ *   focus → beforeinput → native value setter → input → change → blur
+ *
+ * A per-element processing lock prevents re-entrant calls on the same
+ * element, and lastAppliedValues tracks the last value we wrote so
+ * idempotent scans never re-trigger a React re-render.
  *
  * @param {HTMLInputElement} el
- * @param {Array}   rules
- * @param {number[]} counts
+ * @param {string} newValue
  */
-function replaceInInputValue(el, rules, counts) {
-  const original = el.value;
-  const updated  = applyRulesToText(original, rules, counts);
-  if (updated !== original) {
-    setNativeValue(el, updated);
+function safelyUpdateInput(el, newValue) {
+  if (processingElements.has(el)) return;
+  processingElements.add(el);
+  try {
+    const wasFocused = document.activeElement === el;
+    if (!wasFocused) el.focus({ preventScroll: true });
+
+    // Signal intent before mutation so editors that intercept beforeinput work correctly
+    el.dispatchEvent(new InputEvent('beforeinput', {
+      bubbles: true, cancelable: true, inputType: 'insertText', data: newValue,
+    }));
+
+    // Use the native prototype setter so React's internal fiber state is updated
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    preserveSelection(el, () => setter.call(el, newValue));
+
+    // Dispatch the events React's onChange handler listens to
+    el.dispatchEvent(new InputEvent('input',  { bubbles: true, cancelable: false }));
+    el.dispatchEvent(new Event(     'change', { bubbles: true }));
+
+    lastAppliedValues.set(el, newValue);
+    if (!wasFocused) el.blur();
+  } finally {
+    processingElements.delete(el);
   }
 }
 
 /**
- * Replace text in a React-controlled <textarea> by applying ALL active
- * rules in one pass, then committing via the native setter.
+ * Update a <textarea> using the same user-like event sequence as
+ * safelyUpdateInput, but using HTMLTextAreaElement.prototype.value.
  *
  * @param {HTMLTextAreaElement} el
- * @param {Array}   rules
- * @param {number[]} counts
+ * @param {string} newValue
  */
-function replaceInTextareaValue(el, rules, counts) {
-  const original = el.value;
-  const updated  = applyRulesToText(original, rules, counts);
-  if (updated !== original) {
-    setNativeValue(el, updated);
+function safelyUpdateTextarea(el, newValue) {
+  if (processingElements.has(el)) return;
+  processingElements.add(el);
+  try {
+    const wasFocused = document.activeElement === el;
+    if (!wasFocused) el.focus({ preventScroll: true });
+
+    el.dispatchEvent(new InputEvent('beforeinput', {
+      bubbles: true, cancelable: true, inputType: 'insertText', data: newValue,
+    }));
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    preserveSelection(el, () => setter.call(el, newValue));
+
+    el.dispatchEvent(new InputEvent('input',  { bubbles: true, cancelable: false }));
+    el.dispatchEvent(new Event(     'change', { bubbles: true }));
+
+    lastAppliedValues.set(el, newValue);
+    if (!wasFocused) el.blur();
+  } finally {
+    processingElements.delete(el);
   }
 }
 
 /**
- * Replace text inside a contenteditable / role="textbox" element by
- * walking every text node WITHIN the element and updating each one
- * individually.  This approach preserves the rich-text DOM structure
- * (paragraphs, spans, marks) that ProseMirror / Slate editors use,
- * instead of collapsing the entire content to a flat string via
- * innerText which would lose formatting and trigger editor resets.
- * A single bubbling "input" event is dispatched on the element after
- * all text nodes have been updated so the host framework can re-sync.
+ * Update text inside a contenteditable / [role="textbox"] element by
+ * walking every Text node and applying rules individually, thereby
+ * preserving the rich-text DOM structure (paragraphs, spans, marks) that
+ * ProseMirror / Slate editors rely on.  A single bubbling "input" event is
+ * dispatched after all mutations so the host framework can re-sync.
  *
- * @param {Element} el
- * @param {Array}   rules
+ * A per-element processing lock prevents concurrent mutations on the same
+ * editor node.
+ *
+ * @param {Element}  el
+ * @param {Array}    rules   — active rules from getActiveRules()
+ * @param {number[]} counts  — per-rule counter (mutated in place)
+ */
+function safelyUpdateContentEditable(el, rules, counts) {
+  if (processingElements.has(el)) return;
+  processingElements.add(el);
+  try {
+    // Collect all text nodes first so the walker is not invalidated by
+    // in-place nodeValue mutations.
+    const textNodes = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    let node = walker.nextNode();
+    while (node) {
+      textNodes.push(node);
+      node = walker.nextNode();
+    }
+
+    let anyChanged = false;
+    for (const textNode of textNodes) {
+      const original = textNode.nodeValue;
+      const updated  = applyRulesToText(original, rules, counts);
+      if (updated !== original) {
+        textNode.nodeValue = updated;
+        anyChanged = true;
+      }
+    }
+
+    // Notify the framework of the change without firing beforeinput here,
+    // since the DOM mutation has already occurred and ProseMirror / Slate
+    // will reconcile from the input event.
+    if (anyChanged) {
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: false }));
+    }
+  } finally {
+    processingElements.delete(el);
+  }
+}
+
+/**
+ * Route an editable element to the correct update function based on its
+ * type.  For input/textarea, applies all rules at once to the full value
+ * string and delegates to safelyUpdateInput / safelyUpdateTextarea.
+ * For contenteditable / role="textbox", delegates to
+ * safelyUpdateContentEditable which walks inner text nodes.
+ *
+ * An idempotency check (lastAppliedValues) skips input/textarea fields
+ * whose value has not changed since the extension last wrote to them.
+ *
+ * @param {Element}  el
+ * @param {Array}    rules
  * @param {number[]} counts
  */
-function replaceInContentEditable(el, rules, counts) {
-  // Collect all text nodes inside the element first, so the walker is not
-  // invalidated by in-place nodeValue mutations.
-  const textNodes = [];
-  const walker = document.createTreeWalker(
-    el,
-    NodeFilter.SHOW_TEXT,
-    null,
-  );
-  let node = walker.nextNode();
-  while (node) {
-    textNodes.push(node);
-    node = walker.nextNode();
+function replaceInEditableElement(el, rules, counts) {
+  const tag  = el.tagName;
+  const type = (el.getAttribute('type') || '').toLowerCase();
+
+  if (tag === 'TEXTAREA') {
+    const original = el.value;
+    // Skip if the extension already set this exact value (prevents pointless re-renders)
+    const lastTA = lastAppliedValues.get(el);
+    if (lastTA !== undefined && lastTA === original) return;
+    const updated = applyRulesToText(original, rules, counts);
+    if (updated !== original) safelyUpdateTextarea(el, updated);
+    return;
   }
 
-  let anyChanged = false;
-  for (const textNode of textNodes) {
-    const original = textNode.nodeValue;
-    const updated  = applyRulesToText(original, rules, counts);
-    if (updated !== original) {
-      textNode.nodeValue = updated;
-      anyChanged = true;
-    }
+  if (tag === 'INPUT' && (type === 'text' || type === '')) {
+    const original = el.value;
+    const lastIn = lastAppliedValues.get(el);
+    if (lastIn !== undefined && lastIn === original) return;
+    const updated = applyRulesToText(original, rules, counts);
+    if (updated !== original) safelyUpdateInput(el, updated);
+    return;
   }
 
-  if (anyChanged) {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+  if (
+    el.getAttribute('contenteditable') === 'true' ||
+    el.getAttribute('role') === 'textbox'
+  ) {
+    safelyUpdateContentEditable(el, rules, counts);
   }
 }
 
 /**
  * Walk all text nodes in `root` that are NOT inside an editable field
- * (those are handled by replaceInAllEditableElements) and apply the
- * active rules to each.
+ * (those are handled by the sequential editable-field loop in
+ * runReplacementScan) and apply the active rules to each.
  *
  * @param {Element} root
  * @param {Array}   rules
@@ -275,7 +374,7 @@ function replaceInVisibleTextNodes(root, rules, counts) {
 
         if (node.nodeType === Node.ELEMENT_NODE) {
           if (shouldSkipElement(node)) return NodeFilter.FILTER_REJECT;
-          // Skip editable subtrees — already handled by replaceInAllEditableElements
+          // Skip editable subtrees — already handled by the editable-field loop
           if (
             node.tagName === 'TEXTAREA' ||
             node.tagName === 'INPUT' ||
@@ -309,41 +408,20 @@ function replaceInVisibleTextNodes(root, rules, counts) {
 }
 
 /**
- * Iterate over EVERY editable field on the page (input, textarea,
- * contenteditable, role="textbox") and apply all active rules.
- * No element is skipped, no result is capped.
- *
- * @param {Array}   rules
- * @param {number[]} counts
- */
-function replaceInAllEditableElements(rules, counts) {
-  const fields = document.querySelectorAll(EDITABLE_SELECTOR);
-  for (const field of fields) {
-    if (isInsideExtensionUI(field)) continue;
-    const tag  = field.tagName;
-    const type = (field.getAttribute('type') || '').toLowerCase();
-    if (tag === 'TEXTAREA') {
-      replaceInTextareaValue(field, rules, counts);
-    } else if (tag === 'INPUT' && (type === 'text' || type === '')) {
-      replaceInInputValue(field, rules, counts);
-    } else if (
-      field.getAttribute('contenteditable') === 'true' ||
-      field.getAttribute('role') === 'textbox'
-    ) {
-      replaceInContentEditable(field, rules, counts);
-    }
-  }
-}
-
-/**
  * Run a full scan of the page and return a structured result.
- * Pass 1 — all editable fields (inputs, textareas, contenteditable elements).
- * Pass 2 — all remaining visible text nodes outside editable fields.
- * Both passes cover the ENTIRE page with no caps or early exits.
  *
- * @returns {{ totalReplacements: number, rules: Array }}
+ * Pass 1 — editable fields processed ONE AT A TIME with a queueMicrotask
+ * yield between each field.  Processing one field at a time means React
+ * can reconcile each individual update before the next mutation begins,
+ * avoiding conflicting intermediate states and preventing one field's
+ * change from destabilising another.
+ *
+ * Pass 2 — all remaining visible text nodes outside editable fields,
+ * updated synchronously after all editable fields are done.
+ *
+ * @returns {Promise<{ totalReplacements: number, rules: Array }>}
  */
-function runReplacementScan() {
+async function runReplacementScan() {
   const rules  = getActiveRules();
   const counts = Array.from({ length: NUM_RULES }, () => 0);
 
@@ -351,13 +429,24 @@ function runReplacementScan() {
     return { totalReplacements: 0, rules: buildResultRules(counts) };
   }
 
-  if (!isInsideExtensionUI(document.body) && !shouldSkipElement(document.body)) {
-    // Pass 1: all editable fields
-    replaceInAllEditableElements(rules, counts);
-
-    // Pass 2: remaining visible text nodes (skips editable subtrees)
-    replaceInVisibleTextNodes(document.body, rules, counts);
+  if (isInsideExtensionUI(document.body) || shouldSkipElement(document.body)) {
+    return { totalReplacements: 0, rules: buildResultRules(counts) };
   }
+
+  // Pass 1: process every editable field sequentially.  The microtask yield
+  // between fields keeps updates deterministic without introducing noticeable
+  // delay to the user.
+  const fields = Array.from(document.querySelectorAll(EDITABLE_SELECTOR));
+  for (const field of fields) {
+    if (isInsideExtensionUI(field)) continue;
+    replaceInEditableElement(field, rules, counts);
+    // Yield to the microtask queue so the event loop can process React
+    // state updates triggered by the previous field before we touch the next.
+    await Promise.resolve();
+  }
+
+  // Pass 2: remaining visible text nodes (skips editable subtrees)
+  replaceInVisibleTextNodes(document.body, rules, counts);
 
   const totalReplacements = counts.reduce((sum, n) => sum + n, 0);
   return { totalReplacements, rules: buildResultRules(counts) };
@@ -558,17 +647,24 @@ function updateStatus(result) {
 /**
  * Execute a scan, update the UI, and show the toast.
  * A guard prevents re-entrant / concurrent scans.
+ *
+ * isInternalUpdate is raised for the entire duration of the async scan so
+ * that any MutationObserver callbacks that fire between microtask yields
+ * are recognised as extension-originated and suppressed.  The observer is
+ * also disconnected before the scan and reconnected afterwards as an
+ * additional safety net.
  */
-function executeScan() {
+async function executeScan() {
   if (scanInProgress) return;
-  scanInProgress = true;
+  scanInProgress    = true;
+  isInternalUpdate  = true;
+
+  // Disconnect observer before touching the DOM.  It is reconnected in the
+  // finally block after the full async scan (including all awaits) completes.
+  if (mutationObserver) mutationObserver.disconnect();
 
   try {
-    // Temporarily disconnect the observer so our own DOM mutations
-    // (e.g. textarea value changes) don't trigger new observer callbacks
-    if (mutationObserver) mutationObserver.disconnect();
-
-    const result = runReplacementScan();
+    const result = await runReplacementScan();
     updateStatus(result);
     showScanSummaryToast(result);
 
@@ -578,8 +674,9 @@ function executeScan() {
       tryPlaySuccessSound();
     }
   } finally {
-    scanInProgress = false;
-    // Reconnect after the synchronous scan is done
+    scanInProgress   = false;
+    isInternalUpdate = false;
+    // Reconnect after the full async scan is done
     if (mutationObserver) {
       mutationObserver.observe(document.body, OBSERVER_CONFIG);
     }
@@ -607,6 +704,10 @@ function startObserver() {
   }
 
   mutationObserver = new MutationObserver((mutations) => {
+    // Ignore mutations that the extension itself caused (field value writes,
+    // toast/overlay updates, etc.)
+    if (isInternalUpdate) return;
+
     // Skip if the only mutations were caused by the extension UI itself
     const nonUIChange = mutations.some(m => !isInsideExtensionUI(m.target));
     if (!nonUIChange) return;
