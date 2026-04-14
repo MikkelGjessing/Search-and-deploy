@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Contentful Text Replacer",
+  "version": "1.0.0",
+  "description": "Automatically find and replace text on Contentful pages with up to 3 configurable rules.",
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.contentful.com/*",
+        "https://*.contentful.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

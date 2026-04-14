@@ -1,0 +1,203 @@
+/* =========================================================
+   Contentful Text Replacer — content.css
+   Styles for the overlay panel and toast notification.
+   ========================================================= */
+
+/* ---------- Overlay panel ---------- */
+#ctr-overlay {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 2147483647;            /* always on top */
+  width: 320px;
+  background: #fff;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  color: #1a1a2e;
+  user-select: none;
+}
+
+#ctr-overlay * {
+  box-sizing: border-box;
+}
+
+#ctr-overlay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid #e4e7ec;
+  cursor: move;
+}
+
+#ctr-overlay-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #101828;
+  flex: 1;
+}
+
+#ctr-global-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #475467;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#ctr-global-toggle {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: #2563eb;
+}
+
+/* ---------- Rules section ---------- */
+#ctr-rules {
+  padding: 10px 12px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ctr-rule-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.ctr-rule-label {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  font-weight: 600;
+  color: #667085;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 2px;
+}
+
+.ctr-input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid #d0d5dd;
+  border-radius: 5px;
+  font-size: 12px;
+  color: #101828;
+  background: #f9fafb;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.ctr-input:focus {
+  border-color: #2563eb;
+  background: #fff;
+}
+
+.ctr-rule-enabled {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: #2563eb;
+  flex-shrink: 0;
+}
+
+/* ---------- Footer buttons ---------- */
+#ctr-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 10px;
+  border-top: 1px solid #e4e7ec;
+}
+
+.ctr-btn {
+  padding: 5px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.ctr-btn:active {
+  opacity: 0.8;
+}
+
+#ctr-save-btn {
+  background: #2563eb;
+  color: #fff;
+  border-color: #2563eb;
+}
+
+#ctr-save-btn:hover {
+  background: #1d4ed8;
+}
+
+#ctr-run-btn {
+  background: #f0fdf4;
+  color: #15803d;
+  border-color: #bbf7d0;
+}
+
+#ctr-run-btn:hover {
+  background: #dcfce7;
+}
+
+/* ---------- Status line ---------- */
+#ctr-status {
+  padding: 0 12px 8px;
+  font-size: 11px;
+  color: #667085;
+  min-height: 16px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+/* ---------- Toast notification ---------- */
+#ctr-toast {
+  position: fixed;
+  top: 16px;
+  right: 352px;                   /* sits to the left of the 320px overlay + margins */
+  z-index: 2147483647;
+  max-width: 280px;
+  background: #1e293b;
+  color: #f1f5f9;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+#ctr-toast.ctr-toast-visible {
+  opacity: 1;
+}
+
+#ctr-toast .ctr-toast-total {
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #a5f3fc;
+}
+
+#ctr-toast .ctr-toast-rule {
+  color: #cbd5e1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ctr-toast .ctr-toast-none {
+  color: #94a3b8;
+  font-style: italic;
+}
