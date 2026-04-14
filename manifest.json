@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Contentful Text Replacer",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Find and replace text on Contentful pages with up to 3 configurable rules. Uses stable, user-like simulated input so React/Contentful state stays consistent.",
   "permissions": [
     "storage"
   ],
+  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": [
@@ -20,7 +21,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["assets/sounds/*.wav"],
+      "resources": ["assets/sounds/*.wav", "assets/sounds/*.mp3"],
       "matches": [
         "https://app.contentful.com/*",
         "https://*.contentful.com/*"

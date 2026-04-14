@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Text Replacer — Sound Settings</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="opt-container">
+    <h1 class="opt-title">Sound Settings</h1>
+    <p class="opt-subtitle">Configure audio feedback for the Contentful Text Replacer.</p>
+
+    <div class="opt-section">
+      <div class="opt-row">
+        <label class="opt-label opt-toggle-label" for="sound-enabled">
+          <input type="checkbox" id="sound-enabled" />
+          Enable sound effects
+        </label>
+      </div>
+
+      <div class="opt-row">
+        <label class="opt-label" for="sound-select">Sound file</label>
+        <select id="sound-select" class="opt-select"></select>
+      </div>
+
+      <div class="opt-row">
+        <button id="test-sound-btn" class="opt-btn opt-btn-secondary">▶ Test sound</button>
+      </div>
+    </div>
+
+    <div id="save-status" class="opt-status" aria-live="polite"></div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

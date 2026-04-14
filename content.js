@@ -29,6 +29,7 @@ const SOUND_THROTTLE_MS       = 1500;   // minimum ms between successive sound p
 const PARTICLE_COUNT          = 22;     // number of confetti particles per celebration
 
 // Bundled sound files in assets/sounds/
+// NOTE: Also listed in options.js — keep both in sync (no shared module possible without a bundler).
 const AVAILABLE_SOUNDS = ['pop.wav', 'chime.wav', 'success.wav'];
 
 // Confetti particle colours
@@ -496,18 +497,6 @@ function tryPlaySuccessSound() {
   audio.play().catch(() => { /* autoplay blocked — ignore */ });
 }
 
-/**
- * Unlock future autoplay by playing the current sound at near-zero volume
- * in direct response to a user gesture (the "Unlock audio" button click).
- */
-function unlockAudio() {
-  const audio = new Audio(getSelectedSoundUrl());
-  audio.volume = 0.01;
-  audio.play().then(() => {
-    audio.pause();
-  }).catch(() => { /* still blocked — nothing to do */ });
-}
-
 /* ------------------------------------------------------------------ */
 /*  Celebration particles                                               */
 /* ------------------------------------------------------------------ */
@@ -772,10 +761,6 @@ function buildOverlayHTML() {
       </div>`;
   }
 
-  const soundOptions = AVAILABLE_SOUNDS
-    .map(f => `<option value="${f}">${f}</option>`)
-    .join('');
-
   return `
     <div id="ctr-overlay-header">
       <span id="ctr-overlay-title">Text Replacer</span>
@@ -783,16 +768,6 @@ function buildOverlayHTML() {
         <input type="checkbox" id="ctr-global-toggle" />
         Active
       </label>
-    </div>
-    <div id="ctr-sound-section">
-      <div id="ctr-sound-row">
-        <label id="ctr-sound-toggle-label" title="Play a sound when replacements are made">
-          <input type="checkbox" id="ctr-sound-toggle" />
-          Sound effects
-        </label>
-        <select id="ctr-sound-select" title="Choose sound file">${soundOptions}</select>
-      </div>
-      <button class="ctr-btn" id="ctr-unlock-audio-btn" title="Click to allow sound playback">🔊 Unlock audio</button>
     </div>
     <div id="ctr-rules">${rulesHTML}</div>
     <div id="ctr-status">Not yet run</div>
@@ -808,12 +783,6 @@ function buildOverlayHTML() {
 function syncOverlayFromSettings() {
   const globalToggle = document.getElementById('ctr-global-toggle');
   if (globalToggle) globalToggle.checked = settings.enabled;
-
-  const soundToggle = document.getElementById('ctr-sound-toggle');
-  if (soundToggle) soundToggle.checked = settings.soundEnabled;
-
-  const soundSelect = document.getElementById('ctr-sound-select');
-  if (soundSelect) soundSelect.value = settings.selectedSoundFile;
 
   for (let i = 0; i < NUM_RULES; i++) {
     const rule     = settings.rules[i];
@@ -833,14 +802,6 @@ function syncSettingsFromOverlay() {
   const globalToggle = document.getElementById('ctr-global-toggle');
   if (globalToggle) settings.enabled = globalToggle.checked;
 
-  const soundToggle = document.getElementById('ctr-sound-toggle');
-  if (soundToggle) settings.soundEnabled = soundToggle.checked;
-
-  const soundSelect = document.getElementById('ctr-sound-select');
-  if (soundSelect && AVAILABLE_SOUNDS.includes(soundSelect.value)) {
-    settings.selectedSoundFile = soundSelect.value;
-  }
-
   for (let i = 0; i < NUM_RULES; i++) {
     const findEl  = document.querySelector(`.ctr-find[data-rule="${i}"]`);
     const replEl  = document.querySelector(`.ctr-replace[data-rule="${i}"]`);
@@ -857,9 +818,8 @@ function syncSettingsFromOverlay() {
  * @param {HTMLElement} overlay
  */
 function attachOverlayListeners(overlay) {
-  const saveBtn        = overlay.querySelector('#ctr-save-btn');
-  const runBtn         = overlay.querySelector('#ctr-run-btn');
-  const unlockAudioBtn = overlay.querySelector('#ctr-unlock-audio-btn');
+  const saveBtn = overlay.querySelector('#ctr-save-btn');
+  const runBtn  = overlay.querySelector('#ctr-run-btn');
 
   saveBtn.addEventListener('click', () => {
     syncSettingsFromOverlay();
@@ -869,11 +829,6 @@ function attachOverlayListeners(overlay) {
   runBtn.addEventListener('click', () => {
     syncSettingsFromOverlay();
     executeScan();
-  });
-
-  unlockAudioBtn.addEventListener('click', () => {
-    syncSettingsFromOverlay();
-    unlockAudio();
   });
 }
 
