@@ -4,8 +4,9 @@
  * Manifest V3 content script that:
  *  1. Injects a draggable overlay UI (top-right corner).
  *  2. Loads saved rules from chrome.storage.sync on start.
- *  3. Runs find-and-replace on every DOM mutation (debounced).
- *  4. Shows a fading toast after each scan that made replacements.
+ *  3. Waits ~1500 ms after page load, then runs the first replacement scan.
+ *  4. Runs find-and-replace on every DOM mutation (debounced).
+ *  5. Shows a fading toast after each scan that made replacements.
  *
  * Only runs on app.contentful.com (and *.contentful.com) pages.
  */
@@ -14,12 +15,24 @@
 /*  Constants                                                           */
 /* ------------------------------------------------------------------ */
 
-const OVERLAY_ID        = 'ctr-overlay';
-const TOAST_ID          = 'ctr-toast';
-const DEBOUNCE_MS          = 400;   // MutationObserver debounce delay
-const TOAST_VISIBLE_MS     = 3500;  // how long the toast stays visible
-const INITIAL_SCAN_DELAY_MS = 600;  // delay before the first auto-scan (lets Contentful finish rendering)
-const NUM_RULES            = 3;
+const OVERLAY_ID              = 'ctr-overlay';
+const TOAST_ID                = 'ctr-toast';
+const DEBOUNCE_MS             = 400;    // MutationObserver debounce delay
+const MUTATION_REACTION_MS    = 400;    // extra delay inside debounce before running
+const TOAST_VISIBLE_MS        = 3500;   // how long the toast stays visible
+const INITIAL_DELAY           = 1500;   // delay before first auto-scan (lets Contentful finish rendering)
+const RETRY_DELAY_MS          = 800;    // retry interval when editable fields are not yet present
+const MAX_RETRIES             = 5;      // max number of retries on initial scan
+const NUM_RULES               = 3;
+
+// Selector for all Contentful editable fields
+const EDITABLE_SELECTOR = [
+  'textarea',
+  'input[type="text"]',
+  'input:not([type])',
+  '[contenteditable="true"]',
+  '[role="textbox"]',
+].join(', ');
 
 // Tags whose text content should never be touched
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'HEAD', 'META', 'LINK']);
@@ -144,6 +157,24 @@ function replaceInTextNode(textNode, activeRules, counts) {
 }
 
 /**
+ * Set the value of a React-controlled input/textarea using the native
+ * prototype setter so React's internal state is updated, then dispatch
+ * the required synthetic events.
+ *
+ * @param {HTMLInputElement|HTMLTextAreaElement} el
+ * @param {string} value
+ */
+function setNativeValue(el, value) {
+  const proto = el.tagName === 'TEXTAREA'
+    ? HTMLTextAreaElement.prototype
+    : HTMLInputElement.prototype;
+  const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+  nativeSetter.call(el, value);
+  el.dispatchEvent(new Event('input',  { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+/**
  * Replace text in a textarea or text <input> by updating its value
  * via the native setter so React (and other framework) controlled
  * inputs pick up the change.
@@ -166,25 +197,81 @@ function replaceInInput(el, activeRules, counts) {
     });
     rule.regex.lastIndex = 0;
     if (value !== before) {
-      // Use the native setter so React synthetic events fire correctly
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-        el.tagName === 'TEXTAREA'
-          ? HTMLTextAreaElement.prototype
-          : HTMLInputElement.prototype,
-        'value',
-      ).set;
-      nativeInputValueSetter.call(el, value);
-
-      // Dispatch events so React / Vue / Angular re-sync their state
-      el.dispatchEvent(new Event('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNativeValue(el, value);
     }
   }
   return replaced;
 }
 
 /**
+ * Replace text inside a contenteditable element or role="textbox" element.
+ * Updates innerText directly and dispatches an input event so React/Slate/
+ * ProseMirror editors re-sync their internal state.
+ *
+ * @param {Element} el
+ * @param {Array}  activeRules
+ * @param {Array}  counts
+ * @returns {number}
+ */
+function replaceInContentEditable(el, activeRules, counts) {
+  let text     = el.innerText !== undefined ? el.innerText : el.textContent;
+  let replaced = 0;
+
+  for (const rule of activeRules) {
+    const before = text;
+    text = text.replace(rule.regex, () => {
+      replaced++;
+      counts[rule.index]++;
+      return rule.replaceText;
+    });
+    rule.regex.lastIndex = 0;
+    if (text !== before) {
+      // Prefer innerText so line breaks are preserved
+      if (el.innerText !== undefined) {
+        el.innerText = text;
+      } else {
+        el.textContent = text;
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+  return replaced;
+}
+
+/**
+ * Find all editable fields in the page (inputs, textareas, contenteditable,
+ * role="textbox") and apply the active replacement rules to each.
+ *
+ * @param {Array} activeRules
+ * @param {Array} counts
+ * @returns {number} total replacements made
+ */
+function replaceInEditableElements(activeRules, counts) {
+  let total = 0;
+  const fields = document.querySelectorAll(EDITABLE_SELECTOR);
+  for (const field of fields) {
+    if (isInsideExtensionUI(field)) continue;
+    const tag  = field.tagName;
+    const type = (field.getAttribute('type') || '').toLowerCase();
+    if (
+      tag === 'TEXTAREA' ||
+      tag === 'INPUT' && (type === 'text' || type === '')
+    ) {
+      total += replaceInInput(field, activeRules, counts);
+    } else if (
+      field.getAttribute('contenteditable') === 'true' ||
+      field.getAttribute('role') === 'textbox'
+    ) {
+      total += replaceInContentEditable(field, activeRules, counts);
+    }
+  }
+  return total;
+}
+
+/**
  * Walk the DOM subtree rooted at `root` and apply all active rules.
+ * Prioritises editable fields (inputs, textareas, contenteditable) and
+ * then falls back to visible text nodes for any remaining matches.
  *
  * @param {Element} root
  * @param {Array}   activeRules
@@ -197,10 +284,12 @@ function walkAndReplace(root, activeRules, counts) {
 
   let total = 0;
 
-  // Use a TreeWalker for efficient traversal
+  // --- Pass 1: editable fields (highest priority) ---
+  total += replaceInEditableElements(activeRules, counts);
+
+  // --- Pass 2: remaining visible text nodes ---
   const walker = document.createTreeWalker(
     root,
-    // SHOW_TEXT (4) | SHOW_ELEMENT (1)
     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
     {
       acceptNode(node) {
@@ -208,9 +297,14 @@ function walkAndReplace(root, activeRules, counts) {
 
         if (node.nodeType === Node.ELEMENT_NODE) {
           const tag = node.tagName;
-          if (SKIP_TAGS.has(tag))             return NodeFilter.FILTER_REJECT;
-          // Accept the element node so the walker descends into it,
-          // but skip it for replacement (we only act on text/inputs below)
+          if (SKIP_TAGS.has(tag)) return NodeFilter.FILTER_REJECT;
+          // Skip editable fields — already handled in pass 1
+          if (
+            tag === 'TEXTAREA' ||
+            tag === 'INPUT' ||
+            node.getAttribute('contenteditable') === 'true' ||
+            node.getAttribute('role') === 'textbox'
+          ) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_SKIP;
         }
 
@@ -220,7 +314,6 @@ function walkAndReplace(root, activeRules, counts) {
     },
   );
 
-  // Collect text nodes first to avoid modifying the tree mid-walk
   const textNodes = [];
   let node = walker.nextNode();
   while (node) {
@@ -232,16 +325,6 @@ function walkAndReplace(root, activeRules, counts) {
     total += replaceInTextNode(textNode, activeRules, counts);
   }
 
-  // Handle textarea and text inputs as a separate pass
-  const inputs = root.querySelectorAll(
-    'input[type="text"], input:not([type]), textarea',
-  );
-  for (const input of inputs) {
-    if (!isInsideExtensionUI(input)) {
-      total += replaceInInput(input, activeRules, counts);
-    }
-  }
-
   return total;
 }
 
@@ -250,7 +333,7 @@ function walkAndReplace(root, activeRules, counts) {
  *
  * @returns {{ totalReplacements: number, rules: Array }}
  */
-function runScan() {
+function runReplacementScan() {
   const activeRules = buildActiveRules();
   const counts = Array.from({ length: NUM_RULES }, () => 0);
 
@@ -283,10 +366,13 @@ function buildResultRules(counts) {
 
 /**
  * Show (or reuse) the toast element with the latest scan result.
+ * Only shows when at least one replacement was made.
  *
  * @param {{ totalReplacements: number, rules: Array }} result
  */
-function showToast(result) {
+function showScanSummaryToast(result) {
+  if (result.totalReplacements === 0) return;
+
   let toast = document.getElementById(TOAST_ID);
   if (!toast) {
     toast = document.createElement('div');
@@ -294,36 +380,30 @@ function showToast(result) {
     document.documentElement.appendChild(toast);
   }
 
-  // Clear any pending hide timer
+  // Clear any pending hide timer (prevents stacking)
   if (toastTimer) {
     clearTimeout(toastTimer);
     toastTimer = null;
   }
 
-  if (result.totalReplacements === 0) {
-    // Optionally show a minimal "no matches" message
-    toast.innerHTML = '<span class="ctr-toast-none">No matches found</span>';
-  } else {
-    const activeRuleLines = result.rules
-      .filter(r => r.findText && r.replacements > 0)
-      .map(
-        r =>
-          `<div class="ctr-toast-rule">` +
-          `Rule ${r.index + 1}: '${escapeHtml(r.findText)}' → '${escapeHtml(r.replaceText)}' (${r.replacements})` +
-          `</div>`,
-      )
-      .join('');
+  const activeRuleLines = result.rules
+    .filter(r => r.findText && r.replacements > 0)
+    .map(
+      r =>
+        `<div class="ctr-toast-rule">` +
+        `Rule ${r.index + 1}: '${escapeHtml(r.findText)}' → '${escapeHtml(r.replaceText)}' (${r.replacements})` +
+        `</div>`,
+    )
+    .join('');
 
-    toast.innerHTML =
-      `<div class="ctr-toast-total">${result.totalReplacements} replacement${result.totalReplacements !== 1 ? 's' : ''} made</div>` +
-      activeRuleLines;
-  }
+  toast.innerHTML =
+    `<div class="ctr-toast-total">${result.totalReplacements} replacement${result.totalReplacements !== 1 ? 's' : ''} made</div>` +
+    activeRuleLines;
 
-  // Fade in
-  // Force a reflow so the transition fires even if the element was already visible
+  // Fade in (force reflow so transition fires even if already visible)
   toast.classList.remove('ctr-toast-visible');
   // eslint-disable-next-line no-void
-  void toast.offsetWidth; // trigger reflow
+  void toast.offsetWidth;
   toast.classList.add('ctr-toast-visible');
 
   // Fade out after TOAST_VISIBLE_MS
@@ -387,12 +467,12 @@ function executeScan() {
 
   try {
     // Temporarily disconnect the observer so our own DOM mutations
-    // (textarea value changes trigger no new observer callbacks)
+    // (e.g. textarea value changes) don't trigger new observer callbacks
     if (mutationObserver) mutationObserver.disconnect();
 
-    const result = runScan();
+    const result = runReplacementScan();
     updateStatus(result);
-    showToast(result);
+    showScanSummaryToast(result);
   } finally {
     scanInProgress = false;
     // Reconnect after the synchronous scan is done
@@ -414,7 +494,8 @@ const OBSERVER_CONFIG = {
 
 /**
  * Start watching document.body for DOM mutations.
- * Each mutation batch is debounced before triggering a scan.
+ * Each mutation batch is debounced, then an additional small delay is
+ * applied before running so React has time to finish rendering.
  */
 function startObserver() {
   if (mutationObserver) {
@@ -426,9 +507,15 @@ function startObserver() {
     const nonUIChange = mutations.some(m => !isInsideExtensionUI(m.target));
     if (!nonUIChange) return;
 
+    // Don't schedule a re-scan while one is already in progress
+    if (scanInProgress) return;
+
     // Debounce: cancel the previous timer and restart
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(executeScan, DEBOUNCE_MS);
+    debounceTimer = setTimeout(() => {
+      // Extra delay to let React finish rendering before we read field values
+      setTimeout(executeScan, MUTATION_REACTION_MS);
+    }, DEBOUNCE_MS);
   });
 
   mutationObserver.observe(document.body, OBSERVER_CONFIG);
@@ -647,6 +734,27 @@ function saveSettings() {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Wait until at least one editable field is present in the DOM, then
+ * execute the first replacement scan.  Retries up to MAX_RETRIES times
+ * with RETRY_DELAY_MS between attempts if no fields are found yet.
+ *
+ * @param {number} [retriesLeft]
+ */
+function waitAndRunInitialScan(retriesLeft = MAX_RETRIES) {
+  const fields = document.querySelectorAll(EDITABLE_SELECTOR);
+  if (fields.length > 0) {
+    executeScan();
+    return;
+  }
+  if (retriesLeft <= 0) {
+    // No editable fields found after all retries — run anyway (text nodes may still apply)
+    executeScan();
+    return;
+  }
+  setTimeout(() => waitAndRunInitialScan(retriesLeft - 1), RETRY_DELAY_MS);
+}
+
+/**
  * Main entry point — called once when the content script loads.
  */
 async function init() {
@@ -666,10 +774,11 @@ async function init() {
   // 4. Start the MutationObserver on body
   startObserver();
 
-  // 5. Immediately run the first scan
+  // 5. After INITIAL_DELAY, wait for editable fields to appear then scan.
+  //    The delay is required because Contentful is a React SPA and fields
+  //    are not rendered synchronously on page load.
   if (settings.enabled) {
-    // Small delay to let Contentful finish its initial render
-    setTimeout(executeScan, INITIAL_SCAN_DELAY_MS);
+    setTimeout(() => waitAndRunInitialScan(), INITIAL_DELAY);
   }
 }
 
